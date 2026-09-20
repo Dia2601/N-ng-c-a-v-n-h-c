@@ -1,0 +1,6 @@
+{
+  "name": "Nắng Của Văn Học",
+  "description": "Nền tảng đọc sách thông minh và nuôi dưỡng văn hóa đọc dành cho học sinh THPT với AI trợ lý văn học, vườn cây tri thức và thử tài văn chương.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
