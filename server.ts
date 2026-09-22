@@ -3,13 +3,101 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import compression from "compression";
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
 
-app.use(express.json());
+// Enable gzip compression for all responses
+app.use(compression());
+app.use(express.json({ limit: "500kb" }));
+
+// In-Memory cache for AI assistant responses
+const aiAnswerCache = new Map<string, { reply: string; timestamp: number }>();
+const AI_CACHE_TTL = 3600 * 1000; // 1 hour
+let circuitBreakerUntil = 0;
+
+// Concurrency Limiter (Semaphore) to protect Gemini and Cloud Run sockets
+let activeAiRequests = 0;
+const MAX_CONCURRENT_AI_REQUESTS = 3;
+
+function getCachedAnswer(key: string): string | null {
+  const cached = aiAnswerCache.get(key);
+  if (cached && Date.now() - cached.timestamp < AI_CACHE_TTL) {
+    return cached.reply;
+  }
+  if (cached) {
+    aiAnswerCache.delete(key);
+  }
+  return null;
+}
+
+function setCachedAnswer(key: string, reply: string) {
+  if (aiAnswerCache.size > 800) {
+    const firstKey = aiAnswerCache.keys().next().value;
+    if (firstKey) aiAnswerCache.delete(firstKey);
+  }
+  aiAnswerCache.set(key, { reply, timestamp: Date.now() });
+}
+
+// In-Memory rate limiter per IP
+const ipRateLimitMap = new Map<string, { count: number; resetTime: number }>();
+function checkRateLimit(ip: string, maxRequests: number = 30, windowMs: number = 60000): boolean {
+  const now = Date.now();
+  const record = ipRateLimitMap.get(ip);
+  if (!record || now > record.resetTime) {
+    ipRateLimitMap.set(ip, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+  if (record.count >= maxRequests) {
+    return false;
+  }
+  record.count += 1;
+  return true;
+}
+
+// Bounded Exponential Backoff Retry with Jitter (Max 2 retries)
+async function callGeminiWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 2,
+  perCallTimeoutMs: number = 7500
+): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    let timer: NodeJS.Timeout | null = null;
+    try {
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Gemini API call timed out")), perCallTimeoutMs);
+      });
+      const res = await Promise.race([fn(), timeoutPromise]);
+      if (timer) clearTimeout(timer);
+      return res;
+    } catch (err: any) {
+      if (timer) clearTimeout(timer);
+      attempt++;
+      const errStr = String(err?.message || err || '').toLowerCase();
+      const isRetryable =
+        errStr.includes('429') ||
+        errStr.includes('resource_exhausted') ||
+        errStr.includes('503') ||
+        errStr.includes('overloaded') ||
+        errStr.includes('500') ||
+        errStr.includes('502') ||
+        errStr.includes('timed out') ||
+        errStr.includes('timeout');
+
+      if (!isRetryable || attempt > maxRetries) {
+        throw err;
+      }
+
+      // Exponential backoff: attempt 1: ~400ms, attempt 2: ~850ms + jitter
+      const backoffDelay = Math.min(1800, Math.pow(2, attempt) * 200 + Math.floor(Math.random() * 200));
+      await new Promise((r) => setTimeout(r, backoffDelay));
+    }
+  }
+}
 
 // Lazy-initialized Gemini AI client
 let aiClient: GoogleGenAI | null = null;
@@ -202,15 +290,55 @@ Nếu bạn cần giải thích cụ thể hơn về một hành động hoặc 
 // AI Assistant Route
 app.post("/api/ai/ask", async (req, res) => {
   try {
-    const { prompt, bookTitle, chapterTitle, excerpt } = req.body;
+    let { prompt, bookTitle, chapterTitle, excerpt } = req.body;
 
-    if (!prompt) {
+    if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: "Prompt is required" });
+    }
+
+    // Payload trimming to save tokens and minimize memory
+    prompt = prompt.trim().slice(0, 350);
+    bookTitle = (bookTitle || '').trim().slice(0, 80);
+    chapterTitle = (chapterTitle || '').trim().slice(0, 80);
+    excerpt = (excerpt || '').trim().slice(0, 250);
+
+    const clientIp = req.ip || req.socket.remoteAddress || "client";
+    
+    // Per-IP throttling: max 30 questions per minute per client
+    if (!checkRateLimit(clientIp, 30, 60000)) {
+      const localReply = generateLocalLiteraryInsight(prompt, bookTitle, chapterTitle);
+      return res.json({
+        reply: localReply,
+        source: 'local-throttled',
+        note: 'Hệ thống đang điều phối lưu lượng, phản hồi bằng tri thức văn học chuẩn xác tức thì.'
+      });
+    }
+
+    // 1. Check in-memory answer cache for identical or common questions
+    const cacheKey = `${bookTitle.toLowerCase()}:::${prompt.toLowerCase()}`;
+    const cached = getCachedAnswer(cacheKey);
+    if (cached) {
+      return res.json({ reply: cached, source: 'cache' });
+    }
+
+    // 2. Circuit breaker check: If Gemini was recently rate-limited or overloaded, use instant local engine
+    if (Date.now() < circuitBreakerUntil) {
+      const localReply = generateLocalLiteraryInsight(prompt, bookTitle, chapterTitle);
+      setCachedAnswer(cacheKey, localReply);
+      return res.json({ reply: localReply, source: 'fallback-circuit-breaker' });
+    }
+
+    // 3. Concurrency check: If max concurrent Gemini requests reached, shed load gracefully to instant local engine
+    if (activeAiRequests >= MAX_CONCURRENT_AI_REQUESTS) {
+      const localReply = generateLocalLiteraryInsight(prompt, bookTitle, chapterTitle);
+      setCachedAnswer(cacheKey, localReply);
+      return res.json({ reply: localReply, source: 'local-concurrency-shed' });
     }
 
     const ai = getGeminiClient();
 
     if (ai) {
+      activeAiRequests++;
       try {
         const systemInstruction = `Bạn là Người Bạn Đồng Hành Đọc Sách của nền tảng "Nắng Của Văn Học".
 MỤC TIÊU DUY NHẤT: Giúp người đọc hiểu sâu sắc nội dung, nhân vật, từ khó, ý nghĩa chi tiết và thông điệp của tác phẩm văn học.
@@ -234,27 +362,45 @@ NGUYÊN TẮC CỐT LÕI:
 5. Giữ đúng ngữ cảnh tác phẩm hiện tại (${bookTitle || 'tác phẩm đang đọc'}). Ví dụ nếu câu hỏi dùng đại từ "ông ấy", "nàng", "họ" thì phải hiểu là nhân vật trong tác phẩm này.
 6. ƯU TIÊN TÍNH CHÍNH XÁC: Tuyệt đối không bịa đặt chi tiết, nhân vật, lời thoại, sự kiện. Nếu câu hỏi nằm ngoài phạm vi tác phẩm hoặc không chắc chắn, hãy NÓI RÕ: "Thông tin này không được đề cập hoặc chưa có đủ cơ sở trong tác phẩm để xác nhận."`;
 
-        const contextInfo = `[Tác phẩm hiện tại: ${bookTitle || 'Văn học'}] ${chapterTitle ? `[Chương/Đoạn: ${chapterTitle}]` : ''} ${excerpt ? `[Trích đoạn tham khảo: ${excerpt.slice(0, 350)}...]` : ''}\nCâu hỏi của người đọc: ${prompt}`;
+        const contextInfo = `[Tác phẩm hiện tại: ${bookTitle || 'Văn học'}] ${chapterTitle ? `[Chương/Đoạn: ${chapterTitle}]` : ''} ${excerpt ? `[Trích đoạn tham khảo: ${excerpt.slice(0, 250)}...]` : ''}\nCâu hỏi của người đọc: ${prompt}`;
 
-        const response = await ai.models.generateContent({
-          model: "gemini-3.8-flash",
-          contents: contextInfo,
-          config: {
-            systemInstruction,
-            temperature: 0.3,
-          },
-        });
+        // Call Gemini with bounded exponential backoff (max 2 retries) & per-call timeout
+        const response = await callGeminiWithBackoff(() =>
+          ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: contextInfo,
+            config: {
+              systemInstruction,
+              temperature: 0.3,
+            },
+          }),
+          2,
+          7500
+        );
 
         const reply = response.text || generateLocalLiteraryInsight(prompt, bookTitle, chapterTitle);
+        setCachedAnswer(cacheKey, reply);
         return res.json({ reply, source: 'gemini' });
-      } catch (geminiError) {
-        console.warn("Gemini API call failed, falling back to local literary intelligence:", geminiError);
+      } catch (geminiError: any) {
+        const errStr = String(geminiError?.message || geminiError || '');
+        console.warn("Gemini API call failed, falling back to local literary intelligence:", errStr.slice(0, 150));
+        
+        // If quota exceeded or overloaded, activate circuit breaker for 60 seconds
+        if (errStr.includes('resource_exhausted') || errStr.includes('429') || errStr.includes('overloaded') || errStr.includes('503')) {
+          circuitBreakerUntil = Date.now() + 60000;
+          console.warn("[Circuit Breaker Activated] 60-second cooldown due to rate limit/overload");
+        }
+
         const fallbackReply = generateLocalLiteraryInsight(prompt, bookTitle, chapterTitle);
+        setCachedAnswer(cacheKey, fallbackReply);
         return res.json({ reply: fallbackReply, source: 'fallback' });
+      } finally {
+        activeAiRequests = Math.max(0, activeAiRequests - 1);
       }
     } else {
       // If no API key configured, use built-in literary knowledge engine
       const localReply = generateLocalLiteraryInsight(prompt, bookTitle, chapterTitle);
+      setCachedAnswer(cacheKey, localReply);
       return res.json({ reply: localReply, source: 'local' });
     }
   } catch (error) {
@@ -266,16 +412,52 @@ NGUYÊN TẮC CỐT LÕI:
 // AI Book Information Generator for Admin (Introduction & Author Profile)
 app.post("/api/ai/generate-book-info", async (req, res) => {
   try {
-    const { title, author } = req.body;
-    if (!title || !title.trim()) {
+    let { title, author } = req.body;
+    if (!title || typeof title !== 'string' || !title.trim()) {
       return res.status(400).json({ error: "Tên tác phẩm là bắt buộc." });
     }
 
-    const bookTitle = title.trim();
-    const bookAuthor = (author || "").trim();
+    const bookTitle = title.trim().slice(0, 80);
+    const bookAuthor = (author || "").trim().slice(0, 80);
+    const cacheKey = `book_info:::${bookTitle.toLowerCase()}:::${bookAuthor.toLowerCase()}`;
+    const cached = getCachedAnswer(cacheKey);
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        return res.json({ ...parsed, source: 'cache' });
+      } catch {
+        // ignore
+      }
+    }
+
+    // Circuit breaker check
+    if (Date.now() < circuitBreakerUntil) {
+      const local = generateLocalBookInfo(bookTitle, bookAuthor);
+      return res.json({
+        success: true,
+        data: local,
+        introduction: local.introduction,
+        authorBio: local.authorBio,
+        source: "local-circuit-breaker"
+      });
+    }
+
+    // Concurrency check
+    if (activeAiRequests >= MAX_CONCURRENT_AI_REQUESTS) {
+      const local = generateLocalBookInfo(bookTitle, bookAuthor);
+      return res.json({
+        success: true,
+        data: local,
+        introduction: local.introduction,
+        authorBio: local.authorBio,
+        source: "local-concurrency-shed"
+      });
+    }
+
     const ai = getGeminiClient();
 
     if (ai) {
+      activeAiRequests++;
       try {
         const systemInstruction = `Bạn là Chuyên gia Nghiên cứu & Giảng dạy Ngữ Văn THPT thuộc nền tảng "Nắng Của Văn Học".
 Nhiệm vụ: Dựa trên tên tác phẩm và tác giả, hãy tạo hai phần nội dung chính xác, sâu sắc, chuẩn mực:
@@ -294,41 +476,62 @@ YÊU CẦU NGHIÊM NGẶT:
 
         const prompt = `Tác phẩm: "${bookTitle}"\nTác giả: "${bookAuthor || 'Chưa cung cấp tác giả'}"\nHãy tạo phần giới thiệu tác phẩm và tiểu sử tác giả theo chuẩn mực ngữ văn THPT.`;
 
-        const response = await ai.models.generateContent({
-          model: "gemini-3.8-flash",
-          contents: prompt,
-          config: {
-            systemInstruction,
-            temperature: 0.2,
-            responseMimeType: "application/json"
-          },
-        });
+        const response = await callGeminiWithBackoff(() =>
+          ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+              systemInstruction,
+              temperature: 0.2,
+              responseMimeType: "application/json"
+            },
+          }),
+          2,
+          8000
+        );
 
         const rawText = response.text || "";
         try {
           const parsed = JSON.parse(rawText);
-          return res.json({
+          const result = {
             introduction: parsed.introduction || "",
             authorBio: parsed.authorBio || "",
             source: "gemini"
+          };
+          setCachedAnswer(cacheKey, JSON.stringify(result));
+          return res.json({
+            success: true,
+            data: result,
+            introduction: result.introduction,
+            authorBio: result.authorBio,
+            source: "gemini"
           });
         } catch {
-          // fallback parser if not strict json
           const local = generateLocalBookInfo(bookTitle, bookAuthor);
           return res.json({
+            success: true,
+            data: local,
             introduction: local.introduction,
             authorBio: local.authorBio,
             source: "gemini-fallback"
           });
         }
-      } catch (err) {
-        console.warn("Gemini generation failed, using local literary knowledge:", err);
+      } catch (err: any) {
+        const errStr = String(err?.message || err || '');
+        console.warn("Gemini generation failed, using local literary knowledge:", errStr.slice(0, 150));
+        if (errStr.includes('resource_exhausted') || errStr.includes('429') || errStr.includes('overloaded') || errStr.includes('503')) {
+          circuitBreakerUntil = Date.now() + 60000;
+        }
+      } finally {
+        activeAiRequests = Math.max(0, activeAiRequests - 1);
       }
     }
 
     // Local fallback with rich canonical Vietnamese & world literature knowledge
     const local = generateLocalBookInfo(bookTitle, bookAuthor);
     return res.json({
+      success: true,
+      data: local,
       introduction: local.introduction,
       authorBio: local.authorBio,
       source: "local"
@@ -341,7 +544,13 @@ YÊU CẦU NGHIÊM NGẶT:
 
 // Health check endpoint
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", app: "Nắng Của Văn Học", timestamp: new Date().toISOString() });
+  res.json({
+    status: "ok",
+    app: "Nắng Của Văn Học",
+    timestamp: new Date().toISOString(),
+    circuitBreakerActive: Date.now() < circuitBreakerUntil,
+    cachedAnswersCount: aiAnswerCache.size
+  });
 });
 
 // Admin authentication endpoint (Keeps admin password on server-side only)
@@ -379,6 +588,14 @@ app.post("/api/admin/verify", (req, res) => {
   return res.status(401).json({ success: false, message: "Tài khoản hoặc mật khẩu quản trị viên không chính xác." });
 });
 
+// Process-level crash prevention
+process.on("unhandledRejection", (reason) => {
+  console.error("[Process Guard] Unhandled Rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[Process Guard] Uncaught Exception:", err);
+});
+
 // Vite middleware / static file handling
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
@@ -389,15 +606,29 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
+    // Cache static assets aggressively (immutable 1 year), HTML no-cache
+    app.use(express.static(distPath, {
+      maxAge: '1y',
+      immutable: true,
+      setHeaders: (res, filePath) => {
+        if (filePath.endsWith('.html')) {
+          res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        }
+      }
+    }));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Nắng Của Văn Học server running on http://0.0.0.0:${PORT}`);
   });
+
+  // Cloud Run load balancer idle connection timeout is 60s.
+  // Setting keepAliveTimeout to 65s prevents 502 Bad Gateway from socket reuse race conditions.
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
 }
 
 startServer();

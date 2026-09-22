@@ -49,10 +49,14 @@ export const AIChatDrawer: React.FC<AIChatDrawerProps> = ({
     setInputValue('');
     setIsLoading(true);
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
     try {
       const response = await fetch('/api/ai/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           prompt: textToSend,
           bookTitle: book.title,
@@ -61,9 +65,7 @@ export const AIChatDrawer: React.FC<AIChatDrawerProps> = ({
         }),
       });
 
-      if (!response.ok) {
-        throw new Error('Server error');
-      }
+      clearTimeout(timeoutId);
 
       const data = await response.json();
       const aiReply: AIMessage = {
@@ -74,7 +76,8 @@ export const AIChatDrawer: React.FC<AIChatDrawerProps> = ({
       };
       setMessages((prev) => [...prev, aiReply]);
     } catch (err) {
-      console.error('Failed to query AI assistant', err);
+      clearTimeout(timeoutId);
+      console.warn('AI assistant request fallback activated:', err);
       const fallbackReply: AIMessage = {
         id: 'reply-' + Date.now(),
         sender: 'ai',
